@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-python test_roundtrip.py
+python -m pytest test_profile_porter.py -v
 pause
