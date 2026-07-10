@@ -1,4 +1,4 @@
-# Profile Porter v1.0.2
+# Profile Porter v1.1.0
 
 Backup and restore web-browser profiles for PC migration. Windows, PySide6, single file, stdlib + Qt only.
 
@@ -28,14 +28,15 @@ For Chromium passwords, on the **old** PC do one of:
 4. Launch the browser, confirm bookmarks/history/extensions.
 5. Sign into sync or import the password CSV.
 
-## Safety model (v1.0.1)
+## Safety model (v1.1 — transactional restore)
 
-Restore is refuse-first. Before a single byte is written:
+Restore is **verify → stage → activate → rollback-on-failure**:
 
 1. **Structural validation** — manifest schema, archive format version, member-name canonicality (no absolute, drive-qualified, `..`, backslash or symlink members), duplicate-member rejection, exact member↔manifest correspondence, unknown browser IDs rejected.
-2. **Full integrity verification** — every file's SHA-256 recomputed and compared, plus a chain hash that binds each entry's *pathname + size + digest* to its predecessor. A corrupted, truncated, reordered or modified archive is refused.
-3. **Safety renames** — existing data at every target (including flat Opera/GX roots and core files) is renamed to `*.pre_restore_<timestamp>`, never deleted. If any rename fails, the restore aborts with nothing written.
-4. Only then are files extracted, with `Path.is_relative_to()` containment as a second layer.
+2. **Full integrity verification** — every file's SHA-256 recomputed and compared, plus a chain hash that binds each entry's *pathname + size + digest* to its predecessor. A corrupted, truncated, reordered or modified archive is refused. (Also available standalone via the **VERIFY ONLY** button.)
+3. **Staging** — every restore unit (profile directory, flat Opera/GX root, core file) is fully extracted into a sibling `<name>.staging_<timestamp>`. Nothing at the final targets is touched during staging; cancelling here leaves the machine exactly as it was.
+4. **Activation** — a short sequence of renames per unit: existing data → `*.pre_restore_<timestamp>` (never deleted), staging → final position.
+5. **Rollback** — if any activation step fails, every completed step is reversed in order and staging is cleaned up. The targets end up exactly as they were, and the failure message says so explicitly (or flags `ROLLBACK INCOMPLETE` with logged paths if the reversal itself hit an error).
 
 Backups stream to `<name>.zip.partial` and are promoted atomically on success — a failed or cancelled backup never destroys a previous good archive.
 
@@ -60,9 +61,12 @@ run.bat            (or: python profile_porter.py)
 test.bat           (or: python -m pytest test_profile_porter.py -v)
 ```
 
-21 tests, stdlib + pytest only — no Qt required. Covers the round trip (Chrome multi-profile, Opera flat, Firefox), cache exclusion incl. case variants, mtime preservation, and rejection of: tampered members, tampered digests, tampered/reordered chains, missing/undeclared/duplicate members, traversal and absolute member names, sibling-prefix containment escapes, unknown browser IDs, malformed and future-format manifests. Plus: flat-profile rename-aside, fatal preservation failure, `.partial` protection of previous archives, and progress accounting for core files.
+25 tests, stdlib + pytest only — no Qt required. Covers the round trip (Chrome multi-profile, Opera flat, Firefox), cache exclusion incl. case variants, mtime preservation, and rejection of: tampered members, tampered digests, tampered/reordered chains, missing/undeclared/duplicate members, traversal and absolute member names, sibling-prefix containment escapes, unknown browser IDs, malformed and future-format manifests. Plus: flat-profile rename-aside, fatal preservation failure with full rollback (including an already-activated unit), staging-cancel leaving targets untouched, no staging leftovers on success, VERIFY ONLY accepting good and rejecting tampered archives, `.partial` protection of previous archives, and progress accounting for core files.
 
 ## Changelog
+
+### 1.1.0 — transactional restore
+Stage-then-activate restore with automatic rollback: profiles are extracted into `*.staging_<ts>` siblings, activated by rename, and every completed step is reversed if anything fails — a half-restored profile is no longer a reachable state. Added VERIFY ONLY (full integrity check without restoring), OPEN FOLDER buttons on backup/restore completion, and a restore summary (units / files / bytes / items set aside). 25 tests.
 
 ### 1.0.2 — scan performance
 One `tasklist` snapshot shared per scan instead of one subprocess per browser (7x fewer process spawns on RESCAN and before backup/restore). Test suite stubs the snapshot entirely — runtime drops from ~2:30 to seconds on Windows. No behavioral changes.

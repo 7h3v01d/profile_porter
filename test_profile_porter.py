@@ -424,5 +424,96 @@ def test_backup_progress_includes_core_files(machine):
     assert done == total, "progress did not account for all bytes (core files)"
 
 
+# ------------------------------------------------- v1.1 transactional restore
+
+
+def leftovers(root: Path) -> list[str]:
+    if not root.exists():
+        return []
+    return [p.name for p in root.rglob("*")
+            if ".staging_" in p.name]
+
+
+def test_no_staging_leftovers_after_success(machine):
+    archive, manifest = do_backup(machine)
+    roots = new_roots(machine)
+    selections, core_map = selections_for(manifest, roots)
+    ok, msg = pp.RestoreEngine(archive, selections, core_map).run()
+    assert ok, msg
+    for root in roots.values():
+        assert not leftovers(root.parent), leftovers(root.parent)
+
+
+def test_cancel_during_staging_leaves_targets_untouched(machine):
+    archive, manifest = do_backup(machine)
+    roots = new_roots(machine)
+    (roots["chrome"] / "Default").mkdir(parents=True)
+    (roots["chrome"] / "Default/marker.txt").write_text("OLD", encoding="utf-8")
+
+    calls = {"n": 0}
+
+    def cancel_after_a_few():
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    selections, core_map = selections_for(manifest, roots)
+    ok, msg = pp.RestoreEngine(archive, selections, core_map,
+                               cancel_check=cancel_after_a_few).run()
+    assert not ok and "nothing at the restore targets was modified" in msg
+    # pre-existing target intact, nothing restored, no asides, no staging
+    assert (roots["chrome"] / "Default/marker.txt").read_text(
+        encoding="utf-8") == "OLD"
+    assert not (roots["chrome"] / "Default/Bookmarks").exists()
+    for root in roots.values():
+        if root.exists():
+            assert not any(".pre_restore_" in p.name for p in root.iterdir())
+            assert not leftovers(root.parent)
+
+
+def test_activation_failure_rolls_back(machine, monkeypatch):
+    """Default activates first; renaming existing 'Profile 1' aside then
+    fails. Everything — including the already-activated Default — must be
+    rolled back to its original state."""
+    archive, manifest = do_backup(machine)
+    roots = new_roots(machine)
+    for prof in ("Default", "Profile 1"):
+        (roots["chrome"] / prof).mkdir(parents=True)
+        (roots["chrome"] / prof / "marker.txt").write_text("OLD", encoding="utf-8")
+
+    real_rename = Path.rename
+
+    def failing_rename(self, target):
+        if self.name == "Profile 1":
+            raise OSError("simulated: access denied")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", failing_rename)
+    selections, core_map = selections_for(manifest, roots)
+    ok, msg = pp.RestoreEngine(archive, selections, core_map).run()
+    assert not ok
+    assert "rolled back" in msg and "ROLLBACK INCOMPLETE" not in msg
+
+    for prof in ("Default", "Profile 1"):
+        assert (roots["chrome"] / prof / "marker.txt").read_text(
+            encoding="utf-8") == "OLD", f"{prof} not rolled back"
+        assert not (roots["chrome"] / prof / "Bookmarks").exists()
+    assert not any(".pre_restore_" in p.name
+                   for p in roots["chrome"].iterdir())
+    assert not leftovers(roots["chrome"])
+
+
+def test_verify_engine_ok_and_rejects_tampered(machine):
+    archive, _ = do_backup(machine)
+    ok, msg = pp.VerifyEngine(archive).run()
+    assert ok and "Integrity verified" in msg
+
+    bad = machine / "bad.zip"
+    rewrite_zip(archive, bad, lambda n, d:
+                (n, b"TAMPERED") if n == "chrome/root/Default/Bookmarks"
+                else (n, d))
+    ok, msg = pp.VerifyEngine(bad).run()
+    assert not ok and "FAILED" in msg
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

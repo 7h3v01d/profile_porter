@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ---------------------------------------------------------------------------
-# Profile Porter v1.0.2
+# Profile Porter v1.1.0
 # Backup / restore web-browser profiles for PC migration.
 #
 # Copyright 2026 Leon Priest (7h3v01d)
@@ -51,6 +51,7 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -61,7 +62,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 APP_NAME = "Profile Porter"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.1.0"
 ARCHIVE_FORMAT_VERSION = 1
 MANIFEST_NAME = "manifest.json"
 CHUNK = 1024 * 1024  # 1 MiB streaming chunks
@@ -652,8 +653,20 @@ class BackupEngine:
 
 
 class RestoreEngine:
-    """Verify EVERYTHING first, then rename existing data aside (fatal on
-    failure), then extract. Qt-free."""
+    """Transactional restore (v1.1):
+
+      verify -> stage -> activate -> (rollback on failure)
+
+    1. The archive is structurally validated and every byte hash-verified.
+    2. Every restore unit (profile directory / flat root / core file) is
+       fully extracted into a staging sibling: <name>.staging_<ts>.
+       Nothing at the final targets is touched during staging.
+    3. Activation is a short sequence of renames per unit: existing data
+       -> <name>.pre_restore_<ts>, staging -> final.
+    4. If ANY activation step fails, every completed step is rolled back
+       in reverse order and staging is cleaned up — the targets end up
+       exactly as they were.
+    Qt-free."""
 
     def __init__(self, archive: Path,
                  selections: list[tuple[str, str, Path]],       # (bid, arc_prefix, root)
@@ -668,14 +681,20 @@ class RestoreEngine:
         self.on_progress = on_progress
         self.cancel_check = cancel_check
 
+    # -- path helpers ----------------------------------------------------
+
     @staticmethod
-    def _aside_path(target: Path, ts: str) -> Path:
-        aside = target.with_name(f"{target.name}.pre_restore_{ts}")
+    def _sibling(target: Path, tag: str, ts: str) -> Path:
+        cand = target.with_name(f"{target.name}.{tag}_{ts}")
         i = 1
-        while aside.exists():
-            aside = target.with_name(f"{target.name}.pre_restore_{ts}_{i}")
+        while cand.exists():
+            cand = target.with_name(f"{target.name}.{tag}_{ts}_{i}")
             i += 1
-        return aside
+        return cand
+
+    @classmethod
+    def _aside_path(cls, target: Path, ts: str) -> Path:
+        return cls._sibling(target, "pre_restore", ts)
 
     @staticmethod
     def _contained(root: Path, rel: str) -> Path:
@@ -685,8 +704,52 @@ class RestoreEngine:
             raise RestoreAborted(f"path containment violated: {rel!r}")
         return dest
 
+    @staticmethod
+    def _extract_member(zf: zipfile.ZipFile, member: str, dest: Path,
+                        emit) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(member) as src, dest.open("wb") as out:
+            while True:
+                chunk = src.read(CHUNK)
+                if not chunk:
+                    break
+                out.write(chunk)
+                emit(len(chunk))
+        try:                                       # keep source mtimes
+            t = time.mktime(zf.getinfo(member).date_time + (0, 0, -1))
+            os.utime(dest, (t, t))
+        except (OSError, OverflowError, ValueError):
+            pass
+
+    @staticmethod
+    def _remove_staging(path: Path) -> None:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+    def _rollback(self, ops: list[tuple[str, Path, Path]]) -> bool:
+        """ops entries are (kind, orig, new); reversing means new -> orig.
+        Returns True if every step reversed cleanly."""
+        clean = True
+        for kind, orig, new in reversed(ops):
+            try:
+                new.rename(orig)
+                self.on_log(f"[rollback] {kind}: {new.name} -> {orig.name}")
+            except OSError as e:
+                clean = False
+                self.on_log(f"[rollback][ERROR] could not reverse {kind} "
+                            f"{new} -> {orig}: {e}")
+        return clean
+
+    # -- main -------------------------------------------------------------
+
     def run(self) -> tuple[bool, str]:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stagings: list[Path] = []
         try:
             with zipfile.ZipFile(self.archive, "r") as zf:
                 manifest = load_and_validate_manifest(zf)
@@ -699,15 +762,14 @@ class RestoreEngine:
                 self.on_log(f"[verify] integrity verified: "
                             f"{len(manifest['files']):,} files")
 
-                # -- phase 2: build the plan against the VALIDATED manifest
+                # -- phase 2: build restore units from the VALIDATED manifest
                 declared_prefixes = {
                     p["arc_prefix"]
                     for b in manifest["browsers"] for p in b["profiles"]}
                 names = set(zf.namelist()) - {MANIFEST_NAME}
 
-                plan: list[tuple[str, str, Path]] = []   # (member, rel, root)
-                flat_roots: list[Path] = []
-                named_targets: list[Path] = []
+                # unit: (kind "dir"|"file", final, [(member, rel_within)])
+                units: list[tuple[str, Path, list[tuple[str, str]]]] = []
                 for bid, prefix, root in self.selections:
                     if prefix not in declared_prefixes:
                         raise ArchiveError(
@@ -716,87 +778,138 @@ class RestoreEngine:
                     base = f"{bid}/root/"
                     if prefix == f"{bid}/root":            # flat profile
                         hit = [n for n in names if n.startswith(base)]
-                        flat_roots.append(root)
+                        final = root
+                        strip = base
                     else:
                         hit = [n for n in names if n.startswith(prefix + "/")]
-                        named_targets.append(root / prefix[len(base):])
-                    for n in hit:
-                        plan.append((n, n[len(base):], root))
+                        final = root / prefix[len(base):]
+                        strip = prefix + "/"
+                    units.append(("dir", final,
+                                  [(n, n[len(strip):]) for n in hit]))
 
-                core_plan: list[tuple[str, str, Path]] = []
                 for bid, (arcs, root) in self.core_map.items():
                     base = f"{bid}/root/"
                     for arc in arcs:
                         if arc not in names:
                             continue
                         if PurePosixPath(arc).name in SKIP_RESTORE_CORE_BASENAMES:
-                            self.on_log(f"[restore] {arc} is machine-specific — "
-                                        f"backed up but not restored (the browser "
-                                        f"regenerates it)")
+                            self.on_log(f"[restore] {arc} is machine-specific "
+                                        f"— backed up but not restored (the "
+                                        f"browser regenerates it)")
                             continue
-                        core_plan.append((arc, arc[len(base):], root))
+                        units.append(("file", root / arc[len(base):],
+                                      [(arc, "")]))
 
-                if not plan and not core_plan:
+                if not units or not any(m for _, _, m in units):
                     return False, "Nothing matched in archive."
 
-                total = sum(zf.getinfo(m).file_size for m, _, _ in plan + core_plan)
-
-                # -- phase 3: safety renames — ALL must succeed before any write
-                self.on_log("[safety] setting existing data aside…")
-                try:
-                    for root in flat_roots:
-                        if root.exists():
-                            aside = self._aside_path(root, ts)
-                            self.on_log(f"[safety] {root.name} -> {aside.name}")
-                            root.rename(aside)
-                    for target in named_targets:
-                        if target.exists():
-                            aside = self._aside_path(target, ts)
-                            self.on_log(f"[safety] {target.name} -> {aside.name}")
-                            target.rename(aside)
-                    for arc, rel, root in core_plan:
-                        target = root / rel
-                        if target.is_file():
-                            aside = self._aside_path(target, ts)
-                            self.on_log(f"[safety] {target.name} -> {aside.name}")
-                            target.rename(aside)
-                except OSError as e:
-                    raise RestoreAborted(
-                        f"could not preserve existing data before restore "
-                        f"({e}) — restore aborted, nothing was written") from e
-
-                # -- phase 4: extract
+                total = sum(zf.getinfo(m).file_size
+                            for _, _, members in units for m, _ in members)
                 done = 0
-                for member, rel, root in plan + core_plan:
-                    if self.cancel_check():
-                        raise Cancelled
-                    dest = self._contained(root, rel)
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(member) as src, dest.open("wb") as out:
-                        while True:
-                            chunk = src.read(CHUNK)
-                            if not chunk:
-                                break
-                            out.write(chunk)
-                            done += len(chunk)
-                            self.on_progress("restore", done, total)
-                    try:                                   # keep source mtimes
-                        t = time.mktime(zf.getinfo(member).date_time + (0, 0, -1))
-                        os.utime(dest, (t, t))
-                    except (OSError, OverflowError, ValueError):
-                        pass
+
+                def emit(n: int):
+                    nonlocal done
+                    done += n
+                    self.on_progress("restore", done, total)
+
+                # -- phase 3: stage everything; targets stay untouched
+                staged: list[tuple[str, Path, Path]] = []  # (kind, final, staging)
+                for kind, final, members in units:
+                    final.parent.mkdir(parents=True, exist_ok=True)
+                    staging = self._sibling(final, "staging", ts)
+                    stagings.append(staging)
+                    self.on_log(f"[stage] {final.name} <- "
+                                f"{len(members):,} file(s)")
+                    if kind == "dir":
+                        staging.mkdir()
+                        for member, rel in members:
+                            if self.cancel_check():
+                                raise Cancelled
+                            self._extract_member(
+                                zf, member, self._contained(staging, rel), emit)
+                    else:
+                        if self.cancel_check():
+                            raise Cancelled
+                        self._extract_member(zf, members[0][0], staging, emit)
+                    staged.append((kind, final, staging))
+
+                # -- phase 4: activate (short renames), rollback on failure
+                ops: list[tuple[str, Path, Path]] = []   # (kind, orig, new)
+                asides = 0
+                try:
+                    for kind, final, staging in staged:
+                        if final.exists():
+                            aside = self._aside_path(final, ts)
+                            final.rename(aside)
+                            ops.append(("aside", final, aside))
+                            asides += 1
+                            self.on_log(f"[safety] {final.name} -> "
+                                        f"{aside.name}")
+                        staging.rename(final)
+                        ops.append(("activate", staging, final))
+                except OSError as e:
+                    clean = self._rollback(ops)
+                    for s in stagings:
+                        self._remove_staging(s)
+                    tail = ("all changes rolled back; nothing at the targets "
+                            "was modified"
+                            if clean else
+                            "ROLLBACK INCOMPLETE — check the log for paths "
+                            "that need manual attention")
+                    raise RestoreAborted(
+                        f"could not preserve existing data or activate "
+                        f"staged files ({e}) — {tail}") from e
+
         except Cancelled:
-            return False, ("Restore cancelled after verification — files "
-                           "already restored were left in place; originals "
-                           f"are preserved as *.pre_restore_{ts}.")
+            for s in stagings:
+                self._remove_staging(s)
+            return False, ("Restore cancelled — staging removed, nothing at "
+                           "the restore targets was modified.")
         except (ArchiveError, RestoreAborted) as e:
             return False, f"Restore refused: {e}"
         except Exception as e:
+            for s in stagings:
+                self._remove_staging(s)
             return False, f"Restore failed: {e}"
 
-        return True, (f"Restore complete: {len(plan) + len(core_plan)} files, "
-                      f"{human_bytes(done)}. Previous data (if any) kept as "
+        n_files = sum(len(m) for _, _, m in units)
+        return True, (f"Restore complete: {len(units)} unit(s), "
+                      f"{n_files:,} files, {human_bytes(done)}. "
+                      f"{asides} existing item(s) kept as "
                       f"*.pre_restore_{ts}.")
+
+
+class VerifyEngine:
+    """Verification-only pass over an archive: structural validation plus a
+    full SHA-256 + chain recomputation. Touches nothing on disk. Qt-free."""
+
+    def __init__(self, archive: Path,
+                 on_log: Callable[[str], None] = _noop,
+                 on_progress: Callable[[str, int, int], None] = _noop,
+                 cancel_check: Callable[[], bool] = lambda: False):
+        self.archive = Path(archive)
+        self.on_log = on_log
+        self.on_progress = on_progress
+        self.cancel_check = cancel_check
+
+    def run(self) -> tuple[bool, str]:
+        try:
+            with zipfile.ZipFile(self.archive, "r") as zf:
+                manifest = load_and_validate_manifest(zf)
+                verify_archive_hashes(zf, manifest,
+                                      on_progress=self.on_progress,
+                                      cancel_check=self.cancel_check)
+        except Cancelled:
+            return False, "Verification cancelled."
+        except (ArchiveError, zipfile.BadZipFile, OSError) as e:
+            return False, f"Verification FAILED: {e}"
+        n = len(manifest["files"])
+        total = sum(e["bytes"] for e in manifest["files"])
+        return True, (f"Integrity verified: {n:,} files, "
+                      f"{human_bytes(total)}, chain head "
+                      f"{manifest['chain_head'][:16]}…  (created "
+                      f"{manifest.get('created_utc', '?')[:19]} on "
+                      f"{manifest.get('host', '?')})")
 
 
 # =====================================================================
@@ -828,8 +941,8 @@ def cli_scan() -> int:
 # =====================================================================
 
 try:
-    from PySide6.QtCore import Qt, QThread, Signal, Slot
-    from PySide6.QtGui import QFont
+    from PySide6.QtCore import Qt, QThread, QUrl, Signal, Slot
+    from PySide6.QtGui import QDesktopServices, QFont
     from PySide6.QtWidgets import (
         QApplication, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
         QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
@@ -1051,6 +1164,10 @@ if QT_AVAILABLE:
             self.ed_target.setEnabled(False)
             self.ed_target.editingFinished.connect(self._target_edited)
             row2.addWidget(self.ed_target, 1)
+            self.btn_verify = QPushButton("VERIFY ONLY")
+            self.btn_verify.clicked.connect(self.start_verify)
+            self.btn_verify.setEnabled(False)
+            row2.addWidget(self.btn_verify)
             self.btn_restore = QPushButton("VERIFY + RESTORE")
             self.btn_restore.setObjectName("primary")
             self.btn_restore.clicked.connect(self.start_restore)
@@ -1079,13 +1196,15 @@ if QT_AVAILABLE:
             self.status_chip.style().polish(self.status_chip)
 
         def _busy(self, on: bool):
-            for b in (self.btn_backup, self.btn_rescan, self.btn_restore):
+            for b in (self.btn_backup, self.btn_rescan, self.btn_restore,
+                      self.btn_verify):
                 b.setEnabled(not on)
             self.btn_cancel.setEnabled(on)
             if not on:
                 self._active_worker = None
                 if self._manifest is None:
                     self.btn_restore.setEnabled(False)
+                    self.btn_verify.setEnabled(False)
 
         def _track(self, worker: QThread):
             self._worker_refs.add(worker)
@@ -1223,6 +1342,7 @@ if QT_AVAILABLE:
                         "fails.)") != QMessageBox.Yes:
                     return
 
+            self._last_backup_dest = dest
             self._set_status("BACKING UP…", "warn")
             self._busy(True)
             self.progress.setValue(0)
@@ -1239,8 +1359,9 @@ if QT_AVAILABLE:
             self._log(("[ok] " if ok else "[err] ") + msg)
             self._set_status("DONE" if ok else "FAILED", "ok" if ok else "err")
             self._busy(False)
-            (QMessageBox.information if ok else QMessageBox.warning)(
-                self, "Backup", msg)
+            self._done_dialog("Backup", ok, msg,
+                              getattr(self, "_last_backup_dest",
+                                      Path()).parent if ok else None)
 
         # -- restore --------------------------------------------------------
 
@@ -1288,6 +1409,45 @@ if QT_AVAILABLE:
                 self.tree_restore.addTopLevelItem(top)
                 top.setExpanded(True)
             self.btn_restore.setEnabled(True)
+            self.btn_verify.setEnabled(True)
+
+        def _done_dialog(self, title: str, ok: bool, msg: str,
+                         open_path: Path | None = None):
+            if not ok:
+                QMessageBox.warning(self, title, msg)
+                return
+            box = QMessageBox(self)
+            box.setWindowTitle(title)
+            box.setText(msg)
+            open_btn = None
+            if open_path is not None:
+                open_btn = box.addButton("OPEN FOLDER", QMessageBox.ActionRole)
+            box.addButton(QMessageBox.Ok)
+            box.exec()
+            if open_btn is not None and box.clickedButton() is open_btn:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(open_path)))
+
+        def start_verify(self):
+            if self._archive_path is None:
+                return
+            self._set_status("VERIFYING ARCHIVE…", "warn")
+            self._busy(True)
+            self.progress.setValue(0)
+            w = EngineWorker(VerifyEngine, self._archive_path, parent=self)
+            w.log.connect(self._log)
+            w.progress.connect(self._on_progress)
+            w.finished_ok.connect(self._verify_done)
+            self._active_worker = w
+            self._track(w)
+            w.start()
+
+        @Slot(bool, str)
+        def _verify_done(self, ok: bool, msg: str):
+            self._log(("[ok] " if ok else "[err] ") + msg)
+            self._set_status("VERIFIED" if ok else "FAILED",
+                             "ok" if ok else "err")
+            self._busy(False)
+            self._done_dialog("Verify", ok, msg)
 
         def _restore_sel_changed(self, cur, _prev):
             if cur is None:
@@ -1365,6 +1525,7 @@ if QT_AVAILABLE:
                     "profiles are restored.\n\nProceed?") != QMessageBox.Yes:
                 return
 
+            self._last_restore_root = selections[0][2]
             self._set_status("VERIFYING ARCHIVE…", "warn")
             self._busy(True)
             self.progress.setValue(0)
@@ -1382,8 +1543,9 @@ if QT_AVAILABLE:
             self._log(("[ok] " if ok else "[err] ") + msg)
             self._set_status("DONE" if ok else "FAILED", "ok" if ok else "err")
             self._busy(False)
-            (QMessageBox.information if ok else QMessageBox.warning)(
-                self, "Restore", msg)
+            self._done_dialog("Restore", ok, msg,
+                              getattr(self, "_last_restore_root", None)
+                              if ok else None)
 
 
 def main() -> int:
