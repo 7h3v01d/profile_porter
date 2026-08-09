@@ -6,11 +6,11 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-python -c "import PySide6" >nul 2>&1
+.venv\Scripts\python.exe -c "import PySide6" >nul 2>&1
 if errorlevel 1 (
   echo [error] PySide6 not installed. Run:  pip install PySide6
   pause
   exit /b 1
 )
-python profile_porter.py %*
+.venv\Scripts\python.exe profile_porter.py %*
 if errorlevel 1 pause
