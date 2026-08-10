@@ -62,7 +62,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 APP_NAME = "Profile Porter"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 ARCHIVE_FORMAT_VERSION = 1
 MANIFEST_NAME = "manifest.json"
 CHUNK = 1024 * 1024  # 1 MiB streaming chunks
@@ -98,6 +98,37 @@ SKIP_FILES = {f.casefold() for f in _SKIP_FILES}
 # installs.ini binds Firefox *installation paths* to profiles and is
 # machine-specific; Firefox regenerates it cleanly on first launch.
 SKIP_RESTORE_CORE_BASENAMES = {"installs.ini"}
+
+
+def _extended_length_prefix(abspath: str) -> str:
+    """Apply Windows' '\\\\?\\' extended-length prefix to an absolute path.
+
+    Pure string transform, written to Windows path rules regardless of the
+    host OS so it can be unit-tested anywhere. Callers pass an already
+    absolute, normalised, backslash path. Idempotent; handles UNC paths.
+    """
+    if abspath.startswith("\\\\?\\"):
+        return abspath
+    if abspath.startswith("\\\\"):          # UNC: \\server\share
+        return "\\\\?\\UNC\\" + abspath[2:]
+    return "\\\\?\\" + abspath
+
+
+def long_path(p) -> str:
+    """A path string safe against the Windows MAX_PATH (260-char) limit.
+
+    Firefox profiles routinely hold deeply nested, origin-encoded storage
+    filenames that sit just under 260 chars on their own; the restore's
+    staging suffix then tips them over, and Windows raises
+    '[WinError 206] The filename or extension is too long'. Prefixing every
+    filesystem call with '\\\\?\\' lifts the ceiling to ~32,767 chars instead
+    of trying to stay under it. No-op off Windows, so the same code runs
+    unchanged on POSIX.
+    """
+    s = os.fspath(p)
+    if os.name != "nt":
+        return s
+    return _extended_length_prefix(os.path.abspath(s))
 
 
 @dataclass
@@ -147,7 +178,7 @@ def iter_files(root: Path, skip_dirs: set[str],
         for d in dirnames:
             if d.casefold() in skip_dirs:
                 continue
-            if (Path(dirpath) / d).is_symlink():
+            if os.path.islink(long_path(Path(dirpath) / d)):
                 if on_skip:
                     on_skip(f"symlinked dir skipped: {Path(dirpath) / d}")
                 continue
@@ -157,7 +188,7 @@ def iter_files(root: Path, skip_dirs: set[str],
             if fn.casefold() in SKIP_FILES:
                 continue
             p = Path(dirpath) / fn
-            if p.is_symlink():
+            if os.path.islink(long_path(p)):
                 if on_skip:
                     on_skip(f"symlink skipped: {p}")
                 continue
@@ -169,7 +200,7 @@ def dir_stats(root: Path, skip_dirs: set[str]) -> tuple[int, int]:
     total = 0
     for p in iter_files(root, skip_dirs):
         try:
-            total += p.stat().st_size
+            total += os.stat(long_path(p)).st_size
             files += 1
         except OSError:
             pass
@@ -526,7 +557,7 @@ class BackupEngine:
 
     def _add_file(self, zf: zipfile.ZipFile, src: Path, arc: str) -> tuple[str, int]:
         try:
-            mtime = time.localtime(src.stat().st_mtime)[:6]
+            mtime = time.localtime(os.stat(long_path(src)).st_mtime)[:6]
             if mtime[0] < 1980:          # zip epoch floor
                 mtime = (1980, 1, 1, 0, 0, 0)
         except OSError:
@@ -535,7 +566,7 @@ class BackupEngine:
         zi.compress_type = zipfile.ZIP_DEFLATED
         h = hashlib.sha256()
         size = 0
-        with src.open("rb") as f, zf.open(zi, "w") as dst:
+        with open(long_path(src), "rb") as f, zf.open(zi, "w") as dst:
             while True:
                 chunk = f.read(CHUNK)
                 if not chunk:
@@ -552,7 +583,7 @@ class BackupEngine:
         for state, _ in self.jobs:
             for rel in state.core_files:
                 try:
-                    total += (state.spec.root / rel).stat().st_size
+                    total += os.stat(long_path(state.spec.root / rel)).st_size
                 except OSError:
                     pass
 
@@ -707,8 +738,8 @@ class RestoreEngine:
     @staticmethod
     def _extract_member(zf: zipfile.ZipFile, member: str, dest: Path,
                         emit) -> None:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with zf.open(member) as src, dest.open("wb") as out:
+        os.makedirs(long_path(dest.parent), exist_ok=True)
+        with zf.open(member) as src, open(long_path(dest), "wb") as out:
             while True:
                 chunk = src.read(CHUNK)
                 if not chunk:
@@ -717,17 +748,18 @@ class RestoreEngine:
                 emit(len(chunk))
         try:                                       # keep source mtimes
             t = time.mktime(zf.getinfo(member).date_time + (0, 0, -1))
-            os.utime(dest, (t, t))
+            os.utime(long_path(dest), (t, t))
         except (OSError, OverflowError, ValueError):
             pass
 
     @staticmethod
     def _remove_staging(path: Path) -> None:
         try:
-            if path.is_dir():
-                shutil.rmtree(path)
-            elif path.exists():
-                path.unlink()
+            lp = long_path(path)
+            if os.path.isdir(lp):
+                shutil.rmtree(lp)
+            elif os.path.exists(lp):
+                os.remove(lp)
         except OSError:
             pass
 
@@ -737,7 +769,7 @@ class RestoreEngine:
         clean = True
         for kind, orig, new in reversed(ops):
             try:
-                new.rename(orig)
+                os.rename(long_path(new), long_path(orig))
                 self.on_log(f"[rollback] {kind}: {new.name} -> {orig.name}")
             except OSError as e:
                 clean = False
@@ -815,13 +847,13 @@ class RestoreEngine:
                 # -- phase 3: stage everything; targets stay untouched
                 staged: list[tuple[str, Path, Path]] = []  # (kind, final, staging)
                 for kind, final, members in units:
-                    final.parent.mkdir(parents=True, exist_ok=True)
+                    os.makedirs(long_path(final.parent), exist_ok=True)
                     staging = self._sibling(final, "staging", ts)
                     stagings.append(staging)
                     self.on_log(f"[stage] {final.name} <- "
                                 f"{len(members):,} file(s)")
                     if kind == "dir":
-                        staging.mkdir()
+                        os.makedirs(long_path(staging), exist_ok=True)
                         for member, rel in members:
                             if self.cancel_check():
                                 raise Cancelled
@@ -840,12 +872,12 @@ class RestoreEngine:
                     for kind, final, staging in staged:
                         if final.exists():
                             aside = self._aside_path(final, ts)
-                            final.rename(aside)
+                            os.rename(long_path(final), long_path(aside))
                             ops.append(("aside", final, aside))
                             asides += 1
                             self.on_log(f"[safety] {final.name} -> "
                                         f"{aside.name}")
-                        staging.rename(final)
+                        os.rename(long_path(staging), long_path(final))
                         ops.append(("activate", staging, final))
                 except OSError as e:
                     clean = self._rollback(ops)

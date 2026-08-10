@@ -1,4 +1,4 @@
-# Profile Porter v1.1.0
+# Profile Porter v1.1.1
 
 Backup and restore web-browser profiles for PC migration. Windows, PySide6, single file, stdlib + Qt only.
 
@@ -64,6 +64,9 @@ test.bat           (or: python -m pytest test_profile_porter.py -v)
 25 tests, stdlib + pytest only — no Qt required. Covers the round trip (Chrome multi-profile, Opera flat, Firefox), cache exclusion incl. case variants, mtime preservation, and rejection of: tampered members, tampered digests, tampered/reordered chains, missing/undeclared/duplicate members, traversal and absolute member names, sibling-prefix containment escapes, unknown browser IDs, malformed and future-format manifests. Plus: flat-profile rename-aside, fatal preservation failure with full rollback (including an already-activated unit), staging-cancel leaving targets untouched, no staging leftovers on success, VERIFY ONLY accepting good and rejecting tampered archives, `.partial` protection of previous archives, and progress accounting for core files.
 
 ## Changelog
+
+### 1.1.1 — Windows long-path (MAX_PATH) fix
+Fixed `[WinError 206] The filename or extension is too long` on restore. Firefox writes deeply nested, origin-encoded `storage\` filenames that sit just under Windows' 260-character `MAX_PATH` limit; the restore's `*.staging_<ts>` suffix tipped them over, so a profile that was fine on the source PC failed to restore. Every profile-side filesystem call now goes through a `long_path()` helper that applies the `\\?\` extended-length prefix on Windows (no-op on other platforms), lifting the limit to ~32,767 characters. Applied to both the restore write path and the backup read path, so backing up a profile that already contains such names works too. No data is dropped and the transactional restore semantics are unchanged. Added revert-proven long-path tests (31 total); repaired the standalone `test_roundtrip.py` script to the current engine API.
 
 ### 1.1.0 — transactional restore
 Stage-then-activate restore with automatic rollback: profiles are extracted into `*.staging_<ts>` siblings, activated by rename, and every completed step is reversed if anything fails — a half-restored profile is no longer a reachable state. Added VERIFY ONLY (full integrity check without restoring), OPEN FOLDER buttons on backup/restore completion, and a restore summary (units / files / bytes / items set aside). 25 tests.

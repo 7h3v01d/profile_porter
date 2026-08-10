@@ -374,14 +374,18 @@ def test_preservation_failure_aborts(machine, monkeypatch):
     (roots["chrome"] / "Default").mkdir(parents=True)
     (roots["chrome"] / "Default/marker.txt").write_text("OLD", encoding="utf-8")
 
-    real_rename = Path.rename
+    # Restore now renames through os.rename(long_path(...), ...) so the deep
+    # profile paths clear the Windows MAX_PATH limit; the failure injection
+    # moved with it. The contract is unchanged: if the existing data cannot be
+    # moved aside, the restore aborts and the original is left untouched.
+    real_rename = os.rename
 
-    def failing_rename(self, target):
-        if self.name == "Default":
+    def failing_rename(src, dst, *a, **k):
+        if os.path.basename(os.fspath(src)) == "Default":
             raise OSError("simulated: access denied")
-        return real_rename(self, target)
+        return real_rename(src, dst, *a, **k)
 
-    monkeypatch.setattr(Path, "rename", failing_rename)
+    monkeypatch.setattr(os, "rename", failing_rename)
     selections, core_map = selections_for(manifest, roots)
     ok, msg = pp.RestoreEngine(archive, selections, core_map).run()
     assert not ok
@@ -480,14 +484,14 @@ def test_activation_failure_rolls_back(machine, monkeypatch):
         (roots["chrome"] / prof).mkdir(parents=True)
         (roots["chrome"] / prof / "marker.txt").write_text("OLD", encoding="utf-8")
 
-    real_rename = Path.rename
+    real_rename = os.rename
 
-    def failing_rename(self, target):
-        if self.name == "Profile 1":
+    def failing_rename(src, dst, *a, **k):
+        if os.path.basename(os.fspath(src)) == "Profile 1":
             raise OSError("simulated: access denied")
-        return real_rename(self, target)
+        return real_rename(src, dst, *a, **k)
 
-    monkeypatch.setattr(Path, "rename", failing_rename)
+    monkeypatch.setattr(os, "rename", failing_rename)
     selections, core_map = selections_for(manifest, roots)
     ok, msg = pp.RestoreEngine(archive, selections, core_map).run()
     assert not ok
@@ -513,6 +517,96 @@ def test_verify_engine_ok_and_rejects_tampered(machine):
                 else (n, d))
     ok, msg = pp.VerifyEngine(bad).run()
     assert not ok and "FAILED" in msg
+
+
+# --------------------------------------------- Windows long-path (MAX_PATH)
+#
+# Firefox writes deeply nested, origin-encoded storage filenames that sit just
+# under Windows' 260-char MAX_PATH on their own; the restore's staging suffix
+# then pushed them over, raising '[WinError 206] The filename or extension is
+# too long'. The fix routes every profile-side filesystem call through
+# long_path(), which applies the '\\?\' extended-length prefix on Windows.
+
+# A real example from the field (safeframe partitioned storage), trimmed only
+# of the drive/profile prefix so the relative part is what we nest.
+DEEP_REL = (
+    "storage/archives/0/2024-01-26/default/"
+    "https++b636497eb18e276672d7302c7c94aa85.safeframe.googlesyndication.com"
+    "^partitionKey=%28https%2Cmytravelquiz.com%29"
+)
+
+
+class TestExtendedLengthPrefix:
+    """Pure string transform, exercised on any OS."""
+
+    def test_drive_path_is_prefixed(self):
+        assert pp._extended_length_prefix(r"C:\Users\x\deep") == r"\\?\C:\Users\x\deep"
+
+    def test_unc_path_uses_unc_form(self):
+        """Revert: drop the UNC branch and a share path is corrupted rather
+        than prefixed into the UNC extended-length form."""
+        assert pp._extended_length_prefix(r"\\server\share\f") == r"\\?\UNC\server\share\f"
+
+    def test_already_prefixed_is_idempotent(self):
+        once = pp._extended_length_prefix(r"C:\a\b")
+        assert pp._extended_length_prefix(once) == once
+
+
+class TestLongPath:
+    def test_noop_on_posix(self):
+        """On POSIX the path is returned unchanged, so the same restore code
+        runs cross-platform without mangling paths."""
+        if os.name == "nt":
+            pytest.skip("POSIX-only behaviour")
+        assert pp.long_path("/tmp/a/b") == "/tmp/a/b"
+        assert pp.long_path(Path("/tmp/a/b")) == "/tmp/a/b"
+
+    def test_prefixes_on_windows(self, monkeypatch):
+        """With Windows semantics simulated, long_path() must apply the
+        extended-length prefix.
+
+        Revert: make long_path() return the plain path (skip
+        _extended_length_prefix) and this fails - which is exactly the bug
+        that produced WinError 206.
+        """
+        monkeypatch.setattr(pp.os, "name", "nt")
+        monkeypatch.setattr(
+            pp.os.path, "abspath",
+            lambda s: "C:\\Users\\kennp\\" + str(s).replace("/", "\\"))
+        out = pp.long_path("storage/archives/0/x")
+        assert out.startswith("\\\\?\\C:\\")
+        assert "/" not in out
+
+
+def test_deep_long_named_file_roundtrips(machine):
+    """End-to-end: a deeply nested, long-named storage file (the shape that
+    triggered WinError 206) must back up and restore with its bytes intact.
+
+    On POSIX long_path() is a no-op, so this pins the extraction plumbing
+    (os.makedirs(long_path(...)) + open(long_path(...)) + containment) rather
+    than the Windows limit itself; the prefix logic is pinned by
+    TestExtendedLengthPrefix / TestLongPath above.
+    """
+    ff_prof = (machine / "Roaming/Mozilla/Firefox/Profiles/"
+               "abcd1234.default-release")
+    deep = ff_prof / DEEP_REL
+    os.makedirs(pp.long_path(deep.parent), exist_ok=True)
+    with open(pp.long_path(deep), "wb") as f:
+        f.write(b"DEEP-DATA-42")
+
+    archive, manifest = do_backup(machine)
+    with zipfile.ZipFile(archive) as zf:
+        assert any(n.endswith("mytravelquiz.com%29") for n in zf.namelist()), \
+            "deep storage file did not reach the archive"
+
+    roots = new_roots(machine)
+    selections, core_map = selections_for(manifest, roots)
+    ok, msg = pp.RestoreEngine(archive, selections, core_map).run()
+    assert ok, msg
+
+    restored = (roots["firefox"] / "Profiles/abcd1234.default-release"
+                / DEEP_REL)
+    assert restored.read_bytes() == b"DEEP-DATA-42"
 
 
 if __name__ == "__main__":
